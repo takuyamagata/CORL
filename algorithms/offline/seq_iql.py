@@ -1,5 +1,3 @@
-# source: https://github.com/gwthomas/IQL-PyTorch
-# https://arxiv.org/pdf/2110.06169.pdf
 import copy
 import os
 import random
@@ -9,6 +7,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import d4rl
+import d4rl.gym_mujoco
 import gym
 import numpy as np
 import pyrallis
@@ -24,15 +23,15 @@ TensorBatch = List[torch.Tensor]
 
 
 EXP_ADV_MAX = 100.0
-LOG_STD_MIN = -20.0
+LOG_STD_MIN = -5.0
 LOG_STD_MAX = 2.0
 
 
 @dataclass
 class TrainConfig:
     # Experiment
-    device: str = "cpu"
-    env: str = "maze2d-large-v1" #"halfcheetah-medium-expert-v2"  # OpenAI gym environment name
+    device: str = "cpu" #"cuda"
+    env: str = "hopper-medium-v2"  # OpenAI gym environment name
     seed: int = 0  # Sets Gym, PyTorch and Numpy seeds
     eval_freq: int = int(5e3)  # How often (time steps) we evaluate
     n_episodes: int = 10  # How many episodes run during evaluation
@@ -40,23 +39,26 @@ class TrainConfig:
     checkpoints_path: Optional[str] = None  # Save path
     load_model: str = ""  # Model load file name, "" doesn't load
     # IQL
-    buffer_size: int = 10_000_000  # Replay buffer size
+    buffer_size: int = 5_000_000  # Replay buffer size
     batch_size: int = 256  # Batch size for all networks
-    discount: float = 0.99  # Discount factor
+    discount_base: float = 0.99  # Base discount factor
+    discount: float = 0.999  # Discount factor
     tau: float = 0.005  # Target network update rate
-    beta: float = 3.0  # Inverse temperature. Small beta -> BC, big beta -> maximizing Q
-    iql_tau: float = 0.7  # Coefficient for asymmetric loss
+    beta: float = 10.0  # Inverse temperature. Small beta -> BC, big beta -> maximizing Q
+    iql_tau: float = 0.9  # Coefficient for asymmetric loss
     iql_deterministic: bool = False  # Use deterministic actor
-    normalize: bool = True  # Normalize states
-    normalize_reward: bool = False  # Normalize reward
-    vf_lr: float = 3e-4  # V function learning rate
-    qf_lr: float = 3e-4  # Critic learning rate
+    normalize: bool = False  # Normalize states
+    normalize_reward: bool = True  # Normalize reward
+    critic_lr: float = 3e-4  # Critic learning rate
     actor_lr: float = 3e-4  # Actor learning rate
     actor_dropout: Optional[float] = None  # Adroit uses dropout for policy network
+    exp_order: int = 4 # Expansion order
+    lr_warm_up_period: int = 0 # Learning rate annealing initial warmup period
+    training_stage_periods = 100000 # number of iterations for each seq. component training 
     # Wandb logging
     project: str = "CORL"
-    group: str = "IQL-D4RL"
-    name: str = "IQL"
+    group: str = "SeqIQL-D4RL"
+    name: str = "SeqIQL"
 
     def __post_init__(self):
         self.name = f"{self.name}-{self.env}-{str(uuid.uuid4())[:8]}"
@@ -65,8 +67,9 @@ class TrainConfig:
 
 
 def soft_update(target: nn.Module, source: nn.Module, tau: float):
-    for target_param, source_param in zip(target.parameters(), source.parameters()):
-        target_param.data.copy_((1 - tau) * target_param.data + tau * source_param.data)
+    with torch.no_grad():
+        for target_param, source_param in zip(target.parameters(), source.parameters()):
+            target_param.data.copy_((1 - tau) * target_param.data + tau * source_param.data)
 
 
 def compute_mean_std(states: np.ndarray, eps: float) -> Tuple[np.ndarray, np.ndarray]:
@@ -189,7 +192,7 @@ def wandb_init(config: dict) -> None:
 
 # @torch.no_grad()
 # def eval_actor(
-#     env: gym.Env, actor: nn.Module, device: str, n_episodes: int, seed: int
+#     env: gym.Env, actor: nn.Module, device: str, n_episodes: int, seed: int,
 # ) -> np.ndarray:
 #     env.seed(seed)
 #     actor.eval()
@@ -199,8 +202,9 @@ def wandb_init(config: dict) -> None:
 #         episode_reward = 0.0
 #         while not done:
 #             action = actor.act(state, device)
-#             state, reward, done, _ = env.step(action)
+#             state_, reward, done, _ = env.step(action)
 #             episode_reward += reward
+#             state = state_
 #         episode_rewards.append(episode_reward)
 
 #     actor.train()
@@ -238,19 +242,13 @@ def eval_actor(
     actor.train()
     return np.asarray(episode_rewards), trajectory, np.asarray(anomaly_score)
 
-def compute_annomaly_score(normal_data: np.ndarray, test_data: np.ndarray, k: int = 10) -> float:
-    d = scipy.spatial.distance.cdist(normal_data, [test_data], 'euclidean')
-    d = np.partition(d.flatten(),(k-1))
-    return - np.log(k) + normal_data.shape[1] * np.log(d[k-1])
-
-
 def return_reward_range(dataset, max_episode_steps):
     returns, lengths = [], []
     ep_ret, ep_len = 0.0, 0
-    for r, d in zip(dataset["rewards"], dataset["terminals"]):
+    for r, d, t in zip(dataset["rewards"], dataset["terminals"], dataset["timeouts"]):
         ep_ret += float(r)
         ep_len += 1
-        if d or ep_len == max_episode_steps:
+        if d or t or ep_len == max_episode_steps:
             returns.append(ep_ret)
             lengths.append(ep_len)
             ep_ret, ep_len = 0.0, 0
@@ -258,18 +256,22 @@ def return_reward_range(dataset, max_episode_steps):
     assert sum(lengths) == len(dataset["rewards"])
     return min(returns), max(returns)
 
+def compute_annomaly_score(normal_data: np.ndarray, test_data: np.ndarray, k: int = 10) -> float:
+    d = scipy.spatial.distance.cdist(normal_data, [test_data], 'euclidean')
+    d = np.partition(d.flatten(),(k-1))
+    return - np.log(k) + normal_data.shape[1] * np.log(d[k-1])
 
-def modify_reward(dataset, env_name, max_episode_steps=1000):
-    if any(s in env_name for s in ("halfcheetah", "hopper", "walker2d")):
+def modify_reward(dataset, env_name, max_episode_steps):
+    if any(s in env_name for s in ("halfcheetah", "hopper", "walker2d", "maze2d")):
         min_ret, max_ret = return_reward_range(dataset, max_episode_steps)
         dataset["rewards"] /= max_ret - min_ret
-        dataset["rewards"] *= max_episode_steps
+        dataset["rewards"] *= 1000
     elif "antmaze" in env_name:
         dataset["rewards"] -= 1.0
 
 
 def asymmetric_l2_loss(u: torch.Tensor, tau: float) -> torch.Tensor:
-    return torch.mean(torch.abs(tau - (u < 0).float()) * u**2)
+    return torch.mean(torch.abs(tau - (u < 0).float()).detach() * u**2) # added .detach() for weights
 
 
 class Squeeze(nn.Module):
@@ -382,48 +384,63 @@ class DeterministicPolicy(nn.Module):
 
 class TwinQ(nn.Module):
     def __init__(
-        self, state_dim: int, action_dim: int, hidden_dim: int = 256, n_hidden: int = 2
+        self, state_dim: int, action_dim: int, hidden_dim: int = 256, n_hidden: int = 2, exp_order: int = 4,
     ):
         super().__init__()
         dims = [state_dim + action_dim, *([hidden_dim] * n_hidden), 1]
-        self.q1 = MLP(dims, squeeze_output=True)
-        self.q2 = MLP(dims, squeeze_output=True)
+        q1, q2 = [], []
+        for _ in range(exp_order + 1):
+            q1.append(MLP(dims, squeeze_output=True))
+            q2.append(MLP(dims, squeeze_output=True))
+        self.q1 = nn.ModuleList(q1)
+        self.q2 = nn.ModuleList(q2)
 
-    def both(
-        self, state: torch.Tensor, action: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def both(self, state: torch.Tensor, action: torch.Tensor, K: int,) -> Tuple[torch.Tensor, torch.Tensor]:
         sa = torch.cat([state, action], 1)
-        return self.q1(sa), self.q2(sa)
+        q1_val, q2_val = [], []
+        for n in range(K + 1):
+            q1_val.append(self.q1[n](sa))
+            q2_val.append(self.q2[n](sa))
+        return torch.stack(q1_val, dim=0), torch.stack(q2_val, dim=0)
 
-    def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        return torch.min(*self.both(state, action))
+    def forward(self, state: torch.Tensor, action: torch.Tensor, K: int) -> torch.Tensor:
+        return torch.min(*self.both(state, action, K))
 
 
 class ValueFunction(nn.Module):
-    def __init__(self, state_dim: int, hidden_dim: int = 256, n_hidden: int = 2):
+    def __init__(self, state_dim: int, hidden_dim: int = 256, n_hidden: int = 2, exp_order: int = 4,):
         super().__init__()
         dims = [state_dim, *([hidden_dim] * n_hidden), 1]
-        self.v = MLP(dims, squeeze_output=True)
+        v = []
+        for _ in range(exp_order + 1):
+            v.append(MLP(dims, squeeze_output=True))
+        self.v = nn.ModuleList(v)
 
-    def forward(self, state: torch.Tensor) -> torch.Tensor:
-        return self.v(state)
+    def forward(self, state: torch.Tensor, K: int) -> torch.Tensor:
+        out = []
+        for n in range(K + 1):
+            out.append(self.v[n](state))
+        return torch.stack(out, dim=0)
+    
 
-
-class ImplicitQLearning:
+class SeqImplicitQLearning:
     def __init__(
         self,
         max_action: float,
         actor: nn.Module,
         actor_optimizer: torch.optim.Optimizer,
         q_network: nn.Module,
-        q_optimizer: torch.optim.Optimizer,
+        critic_optimizer: torch.optim.Optimizer,
         v_network: nn.Module,
-        v_optimizer: torch.optim.Optimizer,
         iql_tau: float = 0.7,
         beta: float = 3.0,
         max_steps: int = 1000000,
-        discount: float = 0.99,
+        discount_base: float = 0.99,
+        discount: float = 0.999,
         tau: float = 0.005,
+        exp_order: int = 4,
+        lr_warm_up_period: int = 0,
+        training_stage_periods = 100000,
         device: str = "cpu",
     ):
         self.max_action = max_action
@@ -431,51 +448,58 @@ class ImplicitQLearning:
         self.q_target = copy.deepcopy(self.qf).requires_grad_(False).to(device)
         self.vf = v_network
         self.actor = actor
-        self.v_optimizer = v_optimizer
-        self.q_optimizer = q_optimizer
+        self.critic_optimizer = critic_optimizer
         self.actor_optimizer = actor_optimizer
-        self.actor_lr_schedule = CosineAnnealingLR(self.actor_optimizer, max_steps)
+        self.actor_lr_schedule = CosineAnnealingLR(self.actor_optimizer, max_steps - lr_warm_up_period)
         self.iql_tau = iql_tau
         self.beta = beta
+        self.discount_base = discount_base
         self.discount = discount
         self.tau = tau
-
+        self.exp_order = exp_order
+        self.lr_warm_up_period = lr_warm_up_period
+        self.training_stage_periods = (np.arange(exp_order) + 1) * training_stage_periods
+        
         self.total_it = 0
         self.device = device
+    
 
-    def _update_v(self, observations, actions, log_dict) -> torch.Tensor:
-        # Update value function
-        with torch.no_grad():
-            target_q = self.q_target(observations, actions)
-
-        v = self.vf(observations)
-        adv = target_q - v
-        v_loss = asymmetric_l2_loss(adv, self.iql_tau)
-        log_dict["value_loss"] = v_loss.item()
-        self.v_optimizer.zero_grad()
-        v_loss.backward()
-        self.v_optimizer.step()
-        return adv
-
-    def _update_q(
+    def _update_critic(
         self,
         next_v: torch.Tensor,
         observations: torch.Tensor,
         actions: torch.Tensor,
         rewards: torch.Tensor,
         terminals: torch.Tensor,
+        K: int,
         log_dict: Dict,
     ):
-        targets = rewards + (1.0 - terminals.float()) * self.discount * next_v.detach()
-        qs = self.qf.both(observations, actions)
-        q_loss = sum(F.mse_loss(q, targets) for q in qs) / len(qs)
+        self.critic_optimizer.zero_grad()
+        
+        # compute loss for Q
+        targets = rewards + (1.0 - torch.stack([terminals for _ in range(next_v.shape[0])], dim=0).float()) * self.discount_base * next_v.detach()
+        qs = self.qf.both(observations, actions, K)
+        q_loss = sum(F.mse_loss(q, targets) for q in qs)
         log_dict["q_loss"] = q_loss.item()
-        self.q_optimizer.zero_grad()
-        q_loss.backward()
-        self.q_optimizer.step()
+
+        # compute loss for V
+        with torch.no_grad():
+            target_q = self.q_target(observations, actions, K)
+        v = self.vf(observations, K)
+        adv = target_q.detach() - v
+        v_loss = asymmetric_l2_loss(adv, self.iql_tau)
+        log_dict["value_loss"] = v_loss.item()
+        
+        # update Q and V
+        loss = (q_loss + v_loss) * (K+1)
+        loss.backward()
+        self.critic_optimizer.step()
 
         # Update target Q network
         soft_update(self.q_target, self.qf, self.tau)
+
+        return torch.sum(adv.detach(), dim=0)
+
 
     def _update_policy(
         self,
@@ -484,7 +508,9 @@ class ImplicitQLearning:
         actions: torch.Tensor,
         log_dict: Dict,
     ):
-        exp_adv = torch.exp(self.beta * adv.detach()).clamp(max=EXP_ADV_MAX)
+        self.actor_optimizer.zero_grad()
+        
+        exp_adv = torch.exp(self.beta * adv).clamp(max=EXP_ADV_MAX)
         policy_out = self.actor(observations)
         if isinstance(policy_out, torch.distributions.Distribution):
             bc_losses = -policy_out.log_prob(actions).sum(-1, keepdim=False)
@@ -496,11 +522,10 @@ class ImplicitQLearning:
             raise NotImplementedError
         policy_loss = torch.mean(exp_adv * bc_losses)
         log_dict["actor_loss"] = policy_loss.item()
-        self.actor_optimizer.zero_grad()
         policy_loss.backward()
         self.actor_optimizer.step()
-        self.actor_lr_schedule.step()
 
+    
     def train(self, batch: TensorBatch) -> Dict[str, float]:
         self.total_it += 1
         (
@@ -512,25 +537,26 @@ class ImplicitQLearning:
         ) = batch
         log_dict = {}
 
+        K = np.sum(self.total_it > self.training_stage_periods) 
         with torch.no_grad():
-            next_v = self.vf(next_observations)
-        # Update value function
-        adv = self._update_v(observations, actions, log_dict)
+            next_v = self.vf(next_observations, K)
+        # Update critic (Q and V functions)
         rewards = rewards.squeeze(dim=-1)
         dones = dones.squeeze(dim=-1)
-        # Update Q function
-        self._update_q(next_v, observations, actions, rewards, dones, log_dict)
+        rewards = torch.cat((rewards.unsqueeze(0), (self.discount - self.discount_base) * next_v[:-1]), dim=0)
+        adv = self._update_critic(next_v, observations, actions, rewards, dones, K, log_dict)
         # Update actor
         self._update_policy(adv, observations, actions, log_dict)
+        if self.total_it > self.lr_warm_up_period:
+            self.actor_lr_schedule.step()
 
         return log_dict
 
     def state_dict(self) -> Dict[str, Any]:
         return {
             "qf": self.qf.state_dict(),
-            "q_optimizer": self.q_optimizer.state_dict(),
+            "critic_optimizer": self.critic_optimizer.state_dict(),
             "vf": self.vf.state_dict(),
-            "v_optimizer": self.v_optimizer.state_dict(),
             "actor": self.actor.state_dict(),
             "actor_optimizer": self.actor_optimizer.state_dict(),
             "actor_lr_schedule": self.actor_lr_schedule.state_dict(),
@@ -539,12 +565,9 @@ class ImplicitQLearning:
 
     def load_state_dict(self, state_dict: Dict[str, Any]):
         self.qf.load_state_dict(state_dict["qf"])
-        self.q_optimizer.load_state_dict(state_dict["q_optimizer"])
+        self.critic_optimizer.load_state_dict(state_dict["critic_optimizer"])
         self.q_target = copy.deepcopy(self.qf)
-
         self.vf.load_state_dict(state_dict["vf"])
-        self.v_optimizer.load_state_dict(state_dict["v_optimizer"])
-
         self.actor.load_state_dict(state_dict["actor"])
         self.actor_optimizer.load_state_dict(state_dict["actor_optimizer"])
         self.actor_lr_schedule.load_state_dict(state_dict["actor_lr_schedule"])
@@ -559,10 +582,12 @@ def train(config: TrainConfig):
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
 
-    dataset = d4rl.qlearning_dataset(env)
+    dataset = env.get_dataset()
 
     if config.normalize_reward:
-        modify_reward(dataset, config.env)
+        modify_reward(dataset, config.env, max_episode_steps=env._max_episode_steps)
+
+    dataset = d4rl.qlearning_dataset(env, dataset)
 
     if config.normalize:
         state_mean, state_std = compute_mean_std(dataset["observations"], eps=1e-3)
@@ -607,8 +632,7 @@ def train(config: TrainConfig):
             state_dim, action_dim, max_action, dropout=config.actor_dropout
         )
     ).to(config.device)
-    v_optimizer = torch.optim.Adam(v_network.parameters(), lr=config.vf_lr)
-    q_optimizer = torch.optim.Adam(q_network.parameters(), lr=config.qf_lr)
+    critic_optimizer = torch.optim.Adam(list(v_network.parameters()) + list(q_network.parameters()), lr=config.critic_lr)
     actor_optimizer = torch.optim.Adam(actor.parameters(), lr=config.actor_lr)
 
     kwargs = {
@@ -616,24 +640,27 @@ def train(config: TrainConfig):
         "actor": actor,
         "actor_optimizer": actor_optimizer,
         "q_network": q_network,
-        "q_optimizer": q_optimizer,
         "v_network": v_network,
-        "v_optimizer": v_optimizer,
+        "critic_optimizer": critic_optimizer,
         "discount": config.discount,
         "tau": config.tau,
         "device": config.device,
-        # IQL
+        # SeqIQL
         "beta": config.beta,
         "iql_tau": config.iql_tau,
+        "discount_base": config.discount_base,
+        "exp_order": config.exp_order,
+        "lr_warm_up_period": config.lr_warm_up_period,
+        "training_stage_periods": config.training_stage_periods,
         "max_steps": config.max_timesteps,
     }
 
     print("---------------------------------------")
-    print(f"Training IQL, Env: {config.env}, Seed: {seed}")
+    print(f"Training SeqIQL, Env: {config.env}, Seed: {seed}")
     print("---------------------------------------")
 
     # Initialize actor
-    trainer = ImplicitQLearning(**kwargs)
+    trainer = SeqImplicitQLearning(**kwargs)
 
     if config.load_model != "":
         policy_file = Path(config.load_model)
@@ -662,7 +689,7 @@ def train(config: TrainConfig):
                 rec_annomaly_score=(t == last_eval_t),
                 dataset=dataset,
             )
-            # eval_scores = eval_actor(
+            # eval_scores, trajectory = eval_actor(
             #     env,
             #     actor,
             #     device=config.device,
@@ -692,3 +719,4 @@ def train(config: TrainConfig):
 
 if __name__ == "__main__":
     train()
+ 

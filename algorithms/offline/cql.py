@@ -17,6 +17,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import wandb
 from torch.distributions import Normal, TanhTransform, TransformedDistribution
+import scipy
 
 TensorBatch = List[torch.Tensor]
 
@@ -200,25 +201,62 @@ def wandb_init(config: dict) -> None:
     wandb.run.save()
 
 
+# @torch.no_grad()
+# def eval_actor(
+#     env: gym.Env, actor: nn.Module, device: str, n_episodes: int, seed: int
+# ) -> np.ndarray:
+#     env.seed(seed)
+#     actor.eval()
+#     episode_rewards = []
+#     for _ in range(n_episodes):
+#         state, done = env.reset(), False
+#         episode_reward = 0.0
+#         while not done:
+#             action = actor.act(state, device)
+#             state, reward, done, _ = env.step(action)
+#             episode_reward += reward
+#         episode_rewards.append(episode_reward)
+
+#     actor.train()
+#     return np.asarray(episode_rewards)
+
 @torch.no_grad()
 def eval_actor(
-    env: gym.Env, actor: nn.Module, device: str, n_episodes: int, seed: int
-) -> np.ndarray:
+    env: gym.Env, actor: nn.Module, device: str, n_episodes: int, seed: int, rec_trajectory: bool = False, rec_annomaly_score: bool = False, dataset: Dict[str, np.ndarray] = {}
+) -> Tuple[np.ndarray, List[TensorBatch]]:
     env.seed(seed)
     actor.eval()
     episode_rewards = []
+    trajectory = []
+    anomaly_score = []
+    if rec_annomaly_score:
+        sa_dataset = np.hstack((dataset['observations'], dataset['actions']))
     for _ in range(n_episodes):
         state, done = env.reset(), False
         episode_reward = 0.0
+        # s, a, r, s_, d = [], [], [], [], []
+        cnt = 0
         while not done:
             action = actor.act(state, device)
-            state, reward, done, _ = env.step(action)
+            state_, reward, done, _ = env.step(action)
             episode_reward += reward
+            # if rec_trajectory:
+            #     s.append(state); a.append(action); r.append(reward); s_.append(state_); d.append(done)
+            if rec_annomaly_score and (cnt % 5 == 0):
+                anomaly_score.append(compute_annomaly_score(sa_dataset, np.hstack((state, action))))
+            state = state_
+            cnt = cnt + 1
         episode_rewards.append(episode_reward)
+        # trajectory.append([s, a, r, s_, d])
 
     actor.train()
-    return np.asarray(episode_rewards)
+    return np.asarray(episode_rewards), trajectory, np.asarray(anomaly_score)
 
+
+def compute_annomaly_score(normal_data: np.ndarray, test_data: np.ndarray, k: int = 10) -> float:
+    d = scipy.spatial.distance.cdist(normal_data, [test_data], 'euclidean')
+    d = np.partition(d.flatten(),(k-1))
+    return - np.log(k) + normal_data.shape[1] * np.log(d[k-1])
 
 def return_reward_range(dataset: Dict, max_episode_steps: int) -> Tuple[float, float]:
     returns, lengths = [], []
@@ -947,6 +985,7 @@ def train(config: TrainConfig):
 
     wandb_init(asdict(config))
 
+    last_eval_t = config.max_timesteps // config.eval_freq * config.eval_freq - 1
     evaluations = []
     for t in range(int(config.max_timesteps)):
         batch = replay_buffer.sample(config.batch_size)
@@ -956,30 +995,41 @@ def train(config: TrainConfig):
         # Evaluate episode
         if (t + 1) % config.eval_freq == 0:
             print(f"Time steps: {t + 1}")
-            eval_scores = eval_actor(
+            eval_scores, trajectory, anomaly_score = eval_actor(
                 env,
                 actor,
                 device=config.device,
-                n_episodes=config.n_episodes,
+                n_episodes=100 if (t == last_eval_t) else 10,
                 seed=config.seed,
+                rec_trajectory=False,
+                rec_annomaly_score=(t == last_eval_t),
+                dataset=dataset,
             )
+            # eval_scores = eval_actor(
+            #     env,
+            #     actor,
+            #     device=config.device,
+            #     n_episodes=config.n_episodes,
+            #     seed=config.seed,
+            # )
             eval_score = eval_scores.mean()
             normalized_eval_score = env.get_normalized_score(eval_score) * 100.0
             evaluations.append(normalized_eval_score)
             print("---------------------------------------")
             print(
-                f"Evaluation over {config.n_episodes} episodes: "
-                f"{eval_score:.3f} , D4RL score: {normalized_eval_score:.3f}"
+                f"Evaluation over {100 if (t == last_eval_t) else 10} episodes: "
+                f"{eval_score:.3f} , D4RL score: {normalized_eval_score:.3f}, anomaly score: {np.mean(anomaly_score)}"
             )
             print("---------------------------------------")
-            if config.checkpoints_path:
+            if config.checkpoints_path is not None:
                 torch.save(
                     trainer.state_dict(),
                     os.path.join(config.checkpoints_path, f"checkpoint_{t}.pt"),
                 )
             wandb.log(
-                {"d4rl_normalized_score": normalized_eval_score},
-                step=trainer.total_it,
+                {"d4rl_normalized_score": normalized_eval_score,
+                 "anomaly_score_mean": np.mean(anomaly_score),
+                }, step=trainer.total_it
             )
 
 
