@@ -240,7 +240,7 @@ def eval_actor(
         # trajectory.append([s, a, r, s_, d])
 
     if anomaly_score==[]:
-            annomaly_score = [np.nan]
+            anomaly_score = [np.nan]
 
     actor.train()
     return np.asarray(episode_rewards), trajectory, np.asarray(anomaly_score)
