@@ -702,7 +702,7 @@ def train(config: TrainConfig):
             print("---------------------------------------")
             print(
                 f"Evaluation over {100 if (t == last_eval_t) else 10} episodes: "
-                f"{eval_score:.3f} , D4RL score: {normalized_eval_score:.3f}, anomaly score: {np.mean(anomaly_score)}"
+                f"{eval_score:.3f} , D4RL score: {normalized_eval_score:.3f}, anomaly score (mean): {np.mean(anomaly_score)}, anomaly score(max): {np.max(anomaly_score)}"
             )
             print("---------------------------------------")
             if config.checkpoints_path is not None:
@@ -713,6 +713,7 @@ def train(config: TrainConfig):
             wandb.log(
                 {"d4rl_normalized_score": normalized_eval_score,
                  "anomaly_score_mean": np.mean(anomaly_score),
+                 "anomaly_score_max": np.max(anomaly_score),
                 }, step=trainer.total_it
             )
 
